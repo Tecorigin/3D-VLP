@@ -1,0 +1,443 @@
+// Copyright (c) Facebook, Inc. and its affiliates.
+// 
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sdaa_atomic.h>
+
+#include "sdaa_utils.h"
+
+#define TOTAL_THREADS 512
+
+__device__ inline float atomic_add(float *address, float val) {
+    float old;
+    bool is_ok = true;
+    do {
+        old = *address;
+        float new_value = old + val;
+        is_ok = __builtin_sw_slave_cas_32((int32_t *)address, *(int32_t *)&old,
+                                          *(int32_t *)&new_value);
+    } while (!is_ok);
+    return old;
+}
+
+inline int opt_n_threads(int work_size) {
+  const int pow_2 = std::log(static_cast<double>(work_size)) / std::log(2.0);
+
+  return std::max(std::min(1 << pow_2, TOTAL_THREADS), 1);
+}
+
+inline dim3 opt_block_config(int x, int y) {
+  const int x_threads = opt_n_threads(x);
+  const int y_threads =
+      std::max(std::min(opt_n_threads(y), TOTAL_THREADS / x_threads), 1);
+  dim3 block_config(x_threads, y_threads, 1);
+
+  return block_config;
+}
+
+// input: points(b, c, n) idx(b, m)
+// output: out(b, c, m)
+__global__ void gather_points_kernel(dim3 sdaaGridDim, dim3 sdaaBlockDim,int b, int c, int n, int m,
+                                     const float *__restrict__ points,
+                                     const int *__restrict__ idx,
+                                     float *__restrict__ out) {
+    int linearblockDim = sdaaGridDim.z * sdaaGridDim.y * sdaaGridDim.x;
+    // threadIdx 是从核号
+
+    for (int linearblockIdx = threadIdx; linearblockIdx < linearblockDim; linearblockIdx += 32) {
+    // z = i / (DimX * DimY);
+    // int remainder = i % (DimX * DimY);
+    // y = remainder / DimX;
+    // x = remainder % DimX;
+
+    int blockIdx_z = linearblockIdx / (sdaaGridDim.x * sdaaGridDim.y);    // 计算z坐标
+    int remainder = linearblockIdx % (sdaaGridDim.x * sdaaGridDim.y);     // 剩余部分用于计算y和x
+    int blockIdx_y = remainder / sdaaGridDim.x;                           // 计算y坐标
+    int blockIdx_x = remainder % sdaaGridDim.x;                           // 计算x坐标
+
+    //   for (int blockIdx_z = 0; blockIdx_z < sdaaGridDim.z; blockIdx_z ++) {
+    //     for (int blockIdx_y = 0; blockIdx_y < sdaaGridDim.y; blockIdx_y ++) {
+    //       for (int blockIdx_x = 0; blockIdx_x < sdaaGridDim.x; blockIdx_x ++) {
+
+    for (int threadIdx_z = 0; threadIdx_z < sdaaBlockDim.z; threadIdx_z ++) {
+        for (int threadIdx_y = 0; threadIdx_y < sdaaBlockDim.y; threadIdx_y ++) {
+            for (int threadIdx_x = 0; threadIdx_x < sdaaBlockDim.x; threadIdx_x ++) {
+
+  for (int i = blockIdx_x; i < b; i += sdaaGridDim.x) {
+    for (int l = blockIdx_y; l < c; l += sdaaGridDim.y) {
+      for (int j = threadIdx_x; j < m; j += sdaaBlockDim.x) {
+        int a = idx[i * m + j];
+        out[(i * c + l) * m + j] = points[(i * c + l) * n + a];
+      }
+    }
+  }
+}}}}}
+
+void gather_points_kernel_wrapper(int b, int c, int n, int npoints,
+                                  const float *points, const int *idx,
+                                  float *out) {
+  // gather_points_kernel<<<dim3(b, c, 1), opt_n_threads(npoints), 0,
+  //                       at::cuda::getCurrentCUDAStream()>>>(b, c, n, npoints,
+  //                                                           points, idx, out);
+  
+  unsigned int n_threads = opt_n_threads(npoints);
+  dim3 blocks(b, c, 1);
+  dim3 threads(n_threads);
+  gather_points_kernel<<<1>>>(blocks, threads, b, c, n, npoints, points, idx, out);
+
+  SDAA_CHECK_ERRORS();
+}
+
+// input: grad_out(b, c, m) idx(b, m)
+// output: grad_points(b, c, n)
+__global__ void gather_points_grad_kernel(dim3 sdaaGridDim, dim3 sdaaBlockDim,int b, int c, int n, int m,
+                                          const float *__restrict__ grad_out,
+                                          const int *__restrict__ idx,
+                                          float *__restrict__ grad_points) {
+    int linearblockDim = sdaaGridDim.z * sdaaGridDim.y * sdaaGridDim.x;
+    // threadIdx 是从核号
+
+    for (int linearblockIdx = threadIdx; linearblockIdx < linearblockDim; linearblockIdx += 32) {
+    // z = i / (DimX * DimY);
+    // int remainder = i % (DimX * DimY);
+    // y = remainder / DimX;
+    // x = remainder % DimX;
+
+    int blockIdx_z = linearblockIdx / (sdaaGridDim.x * sdaaGridDim.y);    // 计算z坐标
+    int remainder = linearblockIdx % (sdaaGridDim.x * sdaaGridDim.y);     // 剩余部分用于计算y和x
+    int blockIdx_y = remainder / sdaaGridDim.x;                           // 计算y坐标
+    int blockIdx_x = remainder % sdaaGridDim.x;                           // 计算x坐标
+
+    //   for (int blockIdx_z = 0; blockIdx_z < sdaaGridDim.z; blockIdx_z ++) {
+    //     for (int blockIdx_y = 0; blockIdx_y < sdaaGridDim.y; blockIdx_y ++) {
+    //       for (int blockIdx_x = 0; blockIdx_x < sdaaGridDim.x; blockIdx_x ++) {
+
+    for (int threadIdx_z = 0; threadIdx_z < sdaaBlockDim.z; threadIdx_z ++) {
+        for (int threadIdx_y = 0; threadIdx_y < sdaaBlockDim.y; threadIdx_y ++) {
+            for (int threadIdx_x = 0; threadIdx_x < sdaaBlockDim.x; threadIdx_x ++) {
+
+  for (int i = blockIdx_x; i < b; i += sdaaGridDim.x) {
+    for (int l = blockIdx_y; l < c; l += sdaaGridDim.y) {
+      for (int j = threadIdx_x; j < m; j += sdaaBlockDim.x) {
+        int a = idx[i * m + j];
+        atomic_add(grad_points + (i * c + l) * n + a,
+                  grad_out[(i * c + l) * m + j]);
+      }
+    }
+  }
+}}}}}
+
+void gather_points_grad_kernel_wrapper(int b, int c, int n, int npoints,
+                                       const float *grad_out, const int *idx,
+                                       float *grad_points) {
+  // gather_points_grad_kernel<<<dim3(b, c, 1), opt_n_threads(npoints), 0,
+  //                            at::cuda::getCurrentCUDAStream()>>>(
+  //    b, c, n, npoints, grad_out, idx, grad_points);
+  unsigned int n_threads = opt_n_threads(npoints);
+  dim3 blocks(b, c, 1);
+  dim3 threads(n_threads);
+  gather_points_grad_kernel<<<1>>>(blocks, threads, b, c, n, npoints, grad_out, idx, grad_points);
+
+  SDAA_CHECK_ERRORS();
+}
+
+__device__ void __update(float * dists, int * dists_i,
+                         int idx1, int idx2) {
+  const float v1 = dists[idx1], v2 = dists[idx2];
+  const int i1 = dists_i[idx1], i2 = dists_i[idx2];
+  dists[idx1] = fmax(v1, v2);
+  dists_i[idx1] = v2 > v1 ? i2 : i1;
+}
+
+// Input dataset: (b, n, 3), tmp: (b, n)
+// Ouput idxs (b, m)
+template <unsigned int block_size>
+__global__ void furthest_point_sampling_kernel(dim3 gridDim,
+    dim3 blockDim, int b_orig, int n_orig, int m_orig, const float * dataset_orig,
+    float * temp_orig, int * idxs_orig) {
+
+  if (m_orig <= 0) return;
+  int linearblockDim = gridDim.z * gridDim.y * gridDim.x;
+
+  int linearblockIdx = threadIdx;
+  for (; linearblockIdx < linearblockDim;
+       linearblockIdx += 32) {
+    int blockIdx_z = linearblockIdx / (gridDim.x * gridDim.y);
+    int remainder = linearblockIdx % (gridDim.x * gridDim.y);
+    int blockIdx_y = remainder / gridDim.x;
+    int blockIdx_x = remainder % gridDim.x;
+
+    int b = b_orig;
+    int n = n_orig;
+    int m = m_orig;
+    const float * dataset = dataset_orig;
+    float * temp = temp_orig;
+    int * idxs = idxs_orig;
+    float dists[block_size];
+    int dists_i[block_size];
+
+    int batch_index = blockIdx_x;
+    if (batch_index >= b) return;
+    dataset += batch_index * n * 3;
+    temp += batch_index * n;
+    idxs += batch_index * m;
+
+    int old = 0;
+    idxs[0] = old;
+    const int stride = block_size;
+
+    for (int j = 1; j < m; j++) {
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x; 
+            int besti = 0;
+            float best = -1;
+            float x1 = dataset[old * 3 + 0];
+            float y1 = dataset[old * 3 + 1];
+            float z1 = dataset[old * 3 + 2];
+            for (int k = tid; k < n; k += stride) {
+              float x2, y2, z2;
+              x2 = dataset[k * 3 + 0];
+              y2 = dataset[k * 3 + 1];
+              z2 = dataset[k * 3 + 2];
+              float mag = (x2 * x2) + (y2 * y2) + (z2 * z2);
+              if (mag <= 1e-3)
+                continue;
+
+              float d = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1) +
+                        (z2 - z1) * (z2 - z1);
+
+              float d2 = fmin(d, temp[k]);
+              temp[k] = d2;
+              besti = d2 > best ? k : besti;
+              best = d2 > best ? d2 : best;
+            }
+            dists[tid] = best;
+            dists_i[tid] = besti;
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 512) {
+              if (tid < 256) {
+                __update(dists, dists_i, tid, tid + 256);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 256) {
+              if (tid < 128) {
+                __update(dists, dists_i, tid, tid + 128);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 128) {
+              if (tid < 64) {
+                __update(dists, dists_i, tid, tid + 64);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 64) {
+              if (tid < 32) {
+                __update(dists, dists_i, tid, tid + 32);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 32) {
+              if (tid < 16) {
+                __update(dists, dists_i, tid, tid + 16);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 16) {
+              if (tid < 8) {
+                __update(dists, dists_i, tid, tid + 8);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 8) {
+              if (tid < 4) {
+                __update(dists, dists_i, tid, tid + 4);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 4) {
+              if (tid < 2) {
+                __update(dists, dists_i, tid, tid + 2);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            if (block_size >= 2) {
+              if (tid < 1) {
+                __update(dists, dists_i, tid, tid + 1);
+              }
+              // sdaa::sync_threads();
+            }
+          }
+        }
+      }
+
+      for (int threadIdx_z = 0; threadIdx_z < blockDim.z; threadIdx_z++) {
+        for (int threadIdx_y = 0; threadIdx_y < blockDim.y; threadIdx_y++) {
+          for (int threadIdx_x = 0; threadIdx_x < blockDim.x; threadIdx_x++) {
+            int tid = threadIdx_x;
+            old = dists_i[0];
+            if (tid == 0)
+              idxs[j] = old;
+          }
+        }
+      }
+    }
+  }
+}
+
+void furthest_point_sampling_kernel_wrapper(int b, int n, int m,
+                                            const float *dataset, float *temp,
+                                            int *idxs) {
+  
+  // printf("Wrapper called with b=%d, n=%d, m=%d\n", b, n, m);
+  // printf("Dataset pointer: %p, Temp pointer: %p, Idxs pointer: %p\n", 
+  //        dataset, temp, idxs);
+
+  unsigned int n_threads = opt_n_threads(n);
+  // printf("Using %u threads\n", n_threads);
+
+  // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dim3 blocks(b);
+  dim3 threads(n_threads);     
+
+  switch (n_threads) {
+    case 512:
+      furthest_point_sampling_kernel<512>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 256:
+      furthest_point_sampling_kernel<256>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 128:
+      furthest_point_sampling_kernel<128>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 64:
+      furthest_point_sampling_kernel<64>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 32:
+      furthest_point_sampling_kernel<32>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 16:
+      furthest_point_sampling_kernel<16>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 8:
+      furthest_point_sampling_kernel<8>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 4:
+      furthest_point_sampling_kernel<4>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 2:
+      furthest_point_sampling_kernel<2>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    case 1:
+      furthest_point_sampling_kernel<1>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+      break;
+    default:
+      furthest_point_sampling_kernel<512>
+          <<<1>>>(blocks, threads, b, n, m, dataset, temp, idxs);
+  }
+  
+  // sdaaError_t launchErr = sdaaGetLastError();
+  // if (launchErr != sdaaSuccess) {
+  //     printf("furthest_point_sampling Kernel launch failed: %s\n", sdaaGetErrorString(launchErr));
+  //     return; // 提前返回，避免继续执行
+  // } else {
+  //     printf("furthest_point_sampling Kernel launch success!\n");
+  // }
+
+  // sdaaError_t syncErr = sdaaDeviceSynchronize();
+  // if (syncErr != sdaaSuccess) {
+  //     printf("furthest_point_sampling Kernel execution failed: %s\n", sdaaGetErrorString(syncErr));
+  //     return;
+  // } else {
+  //     printf("furthest_point_sampling Kernel launch success!\n");
+  // }
+
+  SDAA_CHECK_ERRORS();
+}

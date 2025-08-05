@@ -1,0 +1,43 @@
+ninja_required_version = 1.3
+cxx = c++
+tecocc = /opt/tecoai/bin/tecocc
+
+cflags = -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/TH -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/THC -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch_sdaa/include -I/opt/tecoai/include -I/root/miniconda3/envs/torch_env_py310/include/python3.10 -I/root/miniconda3/envs/torch_env_py310/include/python3.10 -c -pthread -B /root/miniconda3/envs/torch_env_py310/compiler_compat -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /root/miniconda3/envs/torch_env_py310/include -fPIC -O2 -isystem /root/miniconda3/envs/torch_env_py310/include -fPIC
+post_cflags = -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=1 -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1016"' -DTORCH_EXTENSION_NAME=_ext
+ldflags = -fPIC -shared -L/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/lib -L/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch_sdaa/lib -lc10 -ltorch -ltorch_cpu -ltorch_python -lc10_sdaa -ltorch_sdaa -Wl,--enable-new-dtags,-R/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/lib -Wl,--enable-new-dtags,-R/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch_sdaa/lib
+sdaa_cflags = -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/TH -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch/include/THC -I/root/miniconda3/envs/torch_env_py310/lib/python3.10/site-packages/torch_sdaa/include -I/opt/tecoai/include -I/root/miniconda3/envs/torch_env_py310/include/python3.10 -I/root/miniconda3/envs/torch_env_py310/include/python3.10 -c -U__CUDA_ARCH__ -DUSE_EXPERIMENTAL_SDAA_API
+sdaa_post_cflags = -flto -fPIC -std=c++17 -D_GLIBCXX_USE_CXX11_ABI=1
+sdaa_ldflags = -flto -fPIC -shared --sdaa-link -fuse-ld=lld -lm
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule sdaa_compile
+  command = $tecocc $sdaa_cflags -c $in -o $out $sdaa_post_cflags
+  depfile = $out.d
+  deps = gcc
+
+rule sdaa_link
+  command = $tecocc $in -o $out $sdaa_ldflags
+
+rule link
+  command = $cxx $in -o $out $ldflags
+
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/group_points.o: compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/group_points.cpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/interpolate.o: compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/interpolate.cpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/ball_query.o: compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/ball_query.cpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/bindings.o: compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/bindings.cpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/sampling.o: compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/sampling.cpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/ball_query_gpu.o: sdaa_compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/ball_query_gpu.scpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/group_points_gpu.o: sdaa_compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/group_points_gpu.scpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/interpolate_gpu.o: sdaa_compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/interpolate_gpu.scpp
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/sampling_gpu.o: sdaa_compile /softwares/3D-VLP/lib/pointnet2_sdaa/_ext_src/src/sampling_gpu.scpp
+
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/lib.linux-x86_64-cpython-310/pointnet2/libtecopointnet2._ext.so: sdaa_link /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/ball_query_gpu.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/group_points_gpu.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/interpolate_gpu.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/sampling_gpu.o
+
+build /softwares/3D-VLP/lib/pointnet2_sdaa/build/lib.linux-x86_64-cpython-310/pointnet2/_ext.cpython-310-x86_64-linux-gnu.so: link /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/group_points.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/interpolate.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/ball_query.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/bindings.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/temp.linux-x86_64-cpython-310/_ext_src/src/sampling.o /softwares/3D-VLP/lib/pointnet2_sdaa/build/lib.linux-x86_64-cpython-310/pointnet2/libtecopointnet2._ext.so
+
+default /softwares/3D-VLP/lib/pointnet2_sdaa/build/lib.linux-x86_64-cpython-310/pointnet2/_ext.cpython-310-x86_64-linux-gnu.so
+

@@ -1,0 +1,162 @@
+// Copyright (c) Facebook, Inc. and its affiliates.
+// 
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <sdaa_atomic.h>
+
+#include "sdaa_utils.h"
+
+#define TOTAL_THREADS 512
+
+inline int opt_n_threads(int work_size) {
+  const int pow_2 = std::log(static_cast<double>(work_size)) / std::log(2.0);
+
+  return std::max(std::min(1 << pow_2, TOTAL_THREADS), 1);
+}
+
+inline dim3 opt_block_config(int x, int y) {
+  const int x_threads = opt_n_threads(x);
+  const int y_threads =
+      std::max(std::min(opt_n_threads(y), TOTAL_THREADS / x_threads), 1);
+  dim3 block_config(x_threads, y_threads, 1);
+
+  return block_config;
+}
+
+__device__ inline float atomic_add(float *address, float val) {
+    float old;
+    bool is_ok = true;
+    do {
+        old = *address;
+        float new_value = old + val;
+        is_ok = __builtin_sw_slave_cas_32((int32_t *)address, *(int32_t *)&old,
+                                          *(int32_t *)&new_value);
+    } while (!is_ok);
+    return old;
+}
+
+// input: points(b, c, n) idx(b, npoints, nsample)
+// output: out(b, c, npoints, nsample)
+__global__ void group_points_kernel(dim3 sdaaGridDim, dim3 sdaaBlockDim,int b, int c, int n, int npoints,
+                                    int nsample,
+                                    const float *__restrict__ points,
+                                    const int *__restrict__ idx,
+                                    float *__restrict__ out) {
+    int linearblockDim = sdaaGridDim.z * sdaaGridDim.y * sdaaGridDim.x;
+    // threadIdx 是从核号
+
+    for (int linearblockIdx = threadIdx; linearblockIdx < linearblockDim; linearblockIdx += 32) {
+    // z = i / (DimX * DimY);
+    // int remainder = i % (DimX * DimY);
+    // y = remainder / DimX;
+    // x = remainder % DimX;
+
+    int blockIdx_z = linearblockIdx / (sdaaGridDim.x * sdaaGridDim.y);    // 计算z坐标
+    int remainder = linearblockIdx % (sdaaGridDim.x * sdaaGridDim.y);     // 剩余部分用于计算y和x
+    int blockIdx_y = remainder / sdaaGridDim.x;                           // 计算y坐标
+    int blockIdx_x = remainder % sdaaGridDim.x;                           // 计算x坐标
+
+    //   for (int blockIdx_z = 0; blockIdx_z < sdaaGridDim.z; blockIdx_z ++) {
+    //     for (int blockIdx_y = 0; blockIdx_y < sdaaGridDim.y; blockIdx_y ++) {
+    //       for (int blockIdx_x = 0; blockIdx_x < sdaaGridDim.x; blockIdx_x ++) {
+
+    for (int threadIdx_z = 0; threadIdx_z < sdaaBlockDim.z; threadIdx_z ++) {
+        for (int threadIdx_y = 0; threadIdx_y < sdaaBlockDim.y; threadIdx_y ++) {
+            for (int threadIdx_x = 0; threadIdx_x < sdaaBlockDim.x; threadIdx_x ++) {
+
+  int batch_index = blockIdx_x;
+  const float *points_2 = points + batch_index * n * c;
+  const int *idx_2 = idx + batch_index * npoints * nsample;
+  float *out_2 = out + batch_index * npoints * nsample * c;
+
+  const int index = threadIdx_y * sdaaBlockDim.x + threadIdx_x;
+  const int stride = sdaaBlockDim.y * sdaaBlockDim.x;
+  // c * npoints
+  for (int i = index; i < c * npoints; i += stride) {
+    const int l = i / npoints;
+    const int j = i % npoints;
+    // nsample
+    // c * npoints * nsample
+    for (int k = 0; k < nsample; ++k) {
+      int ii = idx_2[j * nsample + k];
+      out_2[(l * npoints + j) * nsample + k] = points_2[l * n + ii];
+    }
+  }
+}}}}}
+
+void group_points_kernel_wrapper(int b, int c, int n, int npoints, int nsample,
+                                 const float *points, const int *idx,
+                                 float *out) {
+  // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dim3 blocks(b);
+  dim3 threads = opt_block_config(npoints, c);
+  group_points_kernel<<<1>>>(blocks, threads, b, c, n, npoints, nsample, points, idx, out);
+  // group_points_kernel<<<b, opt_block_config(npoints, c), 0, stream>>>(
+  //    b, c, n, npoints, nsample, points, idx, out);
+
+  SDAA_CHECK_ERRORS();
+}
+
+// input: grad_out(b, c, npoints, nsample), idx(b, npoints, nsample)
+// output: grad_points(b, c, n)
+__global__ void group_points_grad_kernel(dim3 sdaaGridDim, dim3 sdaaBlockDim,int b, int c, int n, int npoints,
+                                         int nsample,
+                                         const float *__restrict__ grad_out,
+                                         const int *__restrict__ idx,
+                                         float *__restrict__ grad_points) {
+    int linearblockDim = sdaaGridDim.z * sdaaGridDim.y * sdaaGridDim.x;
+    // threadIdx 是从核号
+
+    for (int linearblockIdx = threadIdx; linearblockIdx < linearblockDim; linearblockIdx += 32) {
+    // z = i / (DimX * DimY);
+    // int remainder = i % (DimX * DimY);
+    // y = remainder / DimX;
+    // x = remainder % DimX;
+
+    int blockIdx_z = linearblockIdx / (sdaaGridDim.x * sdaaGridDim.y);    // 计算z坐标
+    int remainder = linearblockIdx % (sdaaGridDim.x * sdaaGridDim.y);     // 剩余部分用于计算y和x
+    int blockIdx_y = remainder / sdaaGridDim.x;                           // 计算y坐标
+    int blockIdx_x = remainder % sdaaGridDim.x;                           // 计算x坐标
+
+    //   for (int blockIdx_z = 0; blockIdx_z < sdaaGridDim.z; blockIdx_z ++) {
+    //     for (int blockIdx_y = 0; blockIdx_y < sdaaGridDim.y; blockIdx_y ++) {
+    //       for (int blockIdx_x = 0; blockIdx_x < sdaaGridDim.x; blockIdx_x ++) {
+
+    for (int threadIdx_z = 0; threadIdx_z < sdaaBlockDim.z; threadIdx_z ++) {
+        for (int threadIdx_y = 0; threadIdx_y < sdaaBlockDim.y; threadIdx_y ++) {
+            for (int threadIdx_x = 0; threadIdx_x < sdaaBlockDim.x; threadIdx_x ++) {
+
+  int batch_index = blockIdx_x;
+  const float * grad_out_2 = grad_out + batch_index * npoints * nsample * c;
+  const int * idx_2 = idx + batch_index * npoints * nsample;
+  float * grad_points_2 = grad_points + batch_index * n * c;
+
+  const int index = threadIdx_y * sdaaBlockDim.x + threadIdx_x;
+  const int stride = sdaaBlockDim.y * sdaaBlockDim.x;
+  for (int i = index; i < c * npoints; i += stride) {
+    const int l = i / npoints;
+    const int j = i % npoints;
+    for (int k = 0; k < nsample; ++k) {
+      int ii = idx_2[j * nsample + k];
+        atomic_add(grad_points_2 + l * n + ii,
+        grad_out_2[(l * npoints + j) * nsample + k]);
+    }
+  }
+}}}}}
+
+
+void group_points_grad_kernel_wrapper(int b, int c, int n, int npoints,
+                                      int nsample, const float *grad_out,
+                                      const int *idx, float *grad_points) {
+  // cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dim3 blocks(b);
+  dim3 threads = opt_block_config(npoints, c);
+  group_points_grad_kernel<<<1>>>(blocks, threads, b, c, n, npoints, nsample, grad_out, idx, grad_points);
+  // group_points_grad_kernel<<<b, opt_block_config(npoints, c), 0, stream>>>(
+  //    b, c, n, npoints, nsample, grad_out, idx, grad_points);
+
+  SDAA_CHECK_ERRORS();
+}
